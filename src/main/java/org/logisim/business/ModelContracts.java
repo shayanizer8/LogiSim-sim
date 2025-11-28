@@ -17,7 +17,7 @@ public final class ModelContracts {
     private ModelContracts() { /* utility holder */ }
 
     /** A simple component identifier. */
-    public static record ComponentId(String id) {
+   public static record ComponentId(String id) {
         public static ComponentId newId() { return new ComponentId(UUID.randomUUID().toString()); }
     }
 
