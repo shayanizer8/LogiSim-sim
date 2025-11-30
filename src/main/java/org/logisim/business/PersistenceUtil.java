@@ -48,6 +48,21 @@ public final class PersistenceUtil {
      * to the data layer (Haider) — this method shows the expected shape.
      */
     public static ModelContracts.Circuit mapToCircuit(Map<String, Object> map) {
+        return mapToCircuit(map, null);
+    }
+
+    /**
+     * Variant of {@link #mapToCircuit(Map)} that optionally exposes the mapping
+     * between saved component ids and the runtime {@link ModelContracts.ComponentId}
+     * instances created during restore. This is useful for UI layers that need
+     * to keep layout metadata aligned with saved ids.
+     *
+     * @param map serialized circuit map
+     * @param savedToRuntimeIds optional output map to receive saved-id -> runtime-id pairs
+     */
+    public static ModelContracts.Circuit mapToCircuit(
+            Map<String, Object> map,
+            Map<String, ModelContracts.ComponentId> savedToRuntimeIds) {
         if (map == null) return null;
         Object nameObj = map.get("name");
         String name = nameObj == null ? "restored" : nameObj.toString();
@@ -71,7 +86,12 @@ public final class PersistenceUtil {
                 ModelContracts.Component comp = ComponentFactory.create(type, state);
                 if (comp == null) continue;
                 circuit.addComponent(comp);
-                if (savedId != null) createdBySavedId.put(savedId, comp);
+                if (savedId != null) {
+                    createdBySavedId.put(savedId, comp);
+                    if (savedToRuntimeIds != null) {
+                        savedToRuntimeIds.put(savedId, comp.getId());
+                    }
+                }
             }
         }
 

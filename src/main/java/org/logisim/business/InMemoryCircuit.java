@@ -120,6 +120,20 @@ public class InMemoryCircuit implements ModelContracts.Circuit {
 
     @Override
     public void simulate() {
+        // Before evaluating, clear all component inputs to UNDEFINED unless they are currently wired
+        // First, build a map from (component, input port) to whether it is driven
+        Map<ComponentId, Set<Integer>> drivenInputs = new HashMap<>();
+        for (var conn : connectors.values()) {
+            drivenInputs.computeIfAbsent(conn.getSinkComponentId(), k -> new HashSet<>()).add(conn.getSinkPortIndex());
+        }
+        for (var comp : components.values()) {
+            int numInputs = comp.getInputs().size();
+            for (int i = 0; i < numInputs; i++) {
+                if (drivenInputs.getOrDefault(comp.getId(), Set.of()).contains(i)) continue;
+                comp.setInputValue(i, Signal.UNDEFINED);
+            }
+        }
+
         // First, attempt a topological evaluation for acyclic graphs. If cycles are
         // present, fallback to an iterative stabilization loop.
         try {

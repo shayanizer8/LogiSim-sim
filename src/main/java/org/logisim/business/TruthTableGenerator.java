@@ -21,16 +21,28 @@ public final class TruthTableGenerator {
 
     public static record TruthRow(Map<ComponentId, Signal> inputs, Map<ComponentId, Signal> outputs) { }
 
+    public static List<TruthRow> generate(ModelContracts.Circuit circuit,
+                                          ModelContracts.SimulationEngine engine) {
+        return generate(circuit, engine, null, null);
+    }
+
     /**
      * Generate the truth table for the provided circuit using the given engine.
-     * Returns a list of rows where each row maps input component id -> value
-     * and output component id -> value.
+     * If {@code inputOrder} or {@code outputOrder} are provided, they control the
+     * ordering of inputs/outputs; otherwise the circuit's component sets are used.
      */
-    public static List<TruthRow> generate(ModelContracts.Circuit circuit, ModelContracts.SimulationEngine engine) {
+    public static List<TruthRow> generate(ModelContracts.Circuit circuit,
+                                          ModelContracts.SimulationEngine engine,
+                                          List<ComponentId> inputOrder,
+                                          List<ComponentId> outputOrder) {
         if (circuit == null || engine == null) return List.of();
 
-        List<ComponentId> inputs = new ArrayList<>(circuit.getInputComponentIds());
-        List<ComponentId> outputs = new ArrayList<>(circuit.getOutputComponentIds());
+        List<ComponentId> inputs = (inputOrder != null && !inputOrder.isEmpty())
+                ? new ArrayList<>(inputOrder)
+                : new ArrayList<>(circuit.getInputComponentIds());
+        List<ComponentId> outputs = (outputOrder != null && !outputOrder.isEmpty())
+                ? new ArrayList<>(outputOrder)
+                : new ArrayList<>(circuit.getOutputComponentIds());
 
         int n = inputs.size();
         int rows = 1 << Math.max(0, n);
@@ -42,8 +54,9 @@ public final class TruthTableGenerator {
             // set inputs
             for (int i = 0; i < n; i++) {
                 ComponentId cid = inputs.get(i);
-                boolean bit = ((mask >> (n - 1 - i)) & 1) == 1;
-                Signal s = bit ? Signal.HIGH : Signal.LOW;
+                int repeats = 1 << (n - i - 1);
+                int position = (mask / repeats) % 2;
+                Signal s = position == 1 ? Signal.HIGH : Signal.LOW;
                 var comp = circuit.getComponent(cid);
                 if (comp instanceof InputPin ip) {
                     ip.setState(s);

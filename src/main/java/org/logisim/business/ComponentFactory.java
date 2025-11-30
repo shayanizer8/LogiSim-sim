@@ -31,6 +31,21 @@ public final class ComponentFactory {
                 restoreInputs(g, state);
                 return g;
             }
+              case "NAND": {
+                var g = new org.logisim.business.gates.NandGate();
+                restoreInputs(g, state);
+                return g;
+            }
+            case "NOR": {
+                var g = new org.logisim.business.gates.NorGate();
+                restoreInputs(g, state);
+                return g;
+            }
+            case "XOR": {
+                var g = new org.logisim.business.gates.XorGate();
+                restoreInputs(g, state);
+                return g;
+            }
             case "INPUT": {
                 var ip = new InputPin();
                 restoreOutputsForInput(ip, state);
