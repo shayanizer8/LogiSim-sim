@@ -1,0 +1,50 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "buildMain",
+            "type": "shell",
+            "command": "javac",
+            "args": [
+                "-d",
+                "bin",
+                "-cp",
+                "src/main/java/org/logisim/ui/LogiSimApp.java",
+                
+            ],
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "buildTests",
+            "type": "shell",
+            "command": "javac",
+            "args": [
+                "-d",
+                "bin",
+                "-cp",
+                "src/main/java;bin",
+                "src/test/java/**/*.java"
+            ],
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "dependsOn": [
+                "buildMain"
+            ]
+        },
+        {
+            "label": "buildAll",
+            "dependsOn": [
+                "buildMain",
+                "buildTests"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

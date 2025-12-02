@@ -1,8 +1,7 @@
 package org.logisim.ui.persistence;
 
 import org.logisim.business.ModelContracts;
-import org.logisim.business.PersistenceUtil;
-import org.logisim.business.ProjectImpl;
+import org.logisim.data.ProjectDataStore;
 import org.logisim.ui.model.CanvasModel;
 
 import java.awt.Point;
@@ -15,58 +14,78 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Coordinates saving/loading of a project (business layer model + UI layout).
+ * UI-layer coordinator that saves/loads a project (business model)
+ * plus canvas/layout information. The actual JSON/data access is
+ * handled by the data-layer {@link ProjectDataStore}.
  */
 public class ProjectPersistenceService {
 
-    public void save(ModelContracts.Project project, Map<String, CanvasModel> layouts, Path path) throws IOException {
+    /**
+     * Save the given project and its per-circuit canvas layouts.
+     *
+     * @param project the business-layer project
+     * @param layouts map from circuit name -> {@link CanvasModel}
+     * @param path    target file path
+     */
+    public void save(ModelContracts.Project project,
+                     Map<String, CanvasModel> layouts,
+                     Path path) throws IOException {
         Objects.requireNonNull(project, "project");
         Objects.requireNonNull(path, "path");
-        Map<String, Object> root = new LinkedHashMap<>();
-        root.put("projectName", project.getName());
-        List<Map<String, Object>> circuits = new ArrayList<>();
-        for (ModelContracts.Circuit circuit : project.listCircuits()) {
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("model", PersistenceUtil.circuitToMap(circuit));
-            CanvasModel canvas = layouts.get(circuit.getName());
-            entry.put("layout", serializeLayout(canvas));
-            circuits.add(entry);
-        }
-        root.put("circuits", circuits);
-        SimpleJson.writeToFile(path, root);
-    }
 
-    public LoadResult load(Path path) throws IOException {
-        Objects.requireNonNull(path, "path");
-        Map<String, Object> root = SimpleJson.readObject(path);
-        String projectName = root.getOrDefault("projectName", "Loaded Project").toString();
-        ProjectImpl project = new ProjectImpl(projectName);
-        Map<String, CanvasModel> layouts = new LinkedHashMap<>();
-        Object circuitsObj = root.get("circuits");
-        if (circuitsObj instanceof List<?> list) {
-            for (Object entryObj : list) {
-                if (!(entryObj instanceof Map<?, ?> entryMap)) continue;
-                @SuppressWarnings("unchecked")
-                Map<String, Object> entry = (Map<String, Object>) entryMap;
-                @SuppressWarnings("unchecked")
-                Map<String, Object> modelMap = entry.get("model") instanceof Map ? (Map<String, Object>) entry.get("model") : null;
-                if (modelMap == null) continue;
-                Map<String, ModelContracts.ComponentId> savedToRuntime = new LinkedHashMap<>();
-                ModelContracts.Circuit circuit = PersistenceUtil.mapToCircuit(modelMap, savedToRuntime);
-                if (circuit == null) continue;
-                project.addCircuit(circuit);
-                CanvasModel canvas = new CanvasModel();
-                Object layoutObj = entry.get("layout");
-                applyLayout(layoutObj, circuit, savedToRuntime, canvas);
-                layouts.put(circuit.getName(), canvas);
+        // Convert CanvasModel layouts to plain Map structures for the data layer
+        Map<String, Map<String, Object>> layoutMaps = new LinkedHashMap<>();
+        if (layouts != null) {
+            for (ModelContracts.Circuit circuit : project.listCircuits()) {
+                CanvasModel canvas = layouts.get(circuit.getName());
+                Map<String, Object> layoutMap = serializeLayout(canvas);
+                layoutMaps.put(circuit.getName(), layoutMap);
             }
         }
-        return new LoadResult(project, layouts);
+
+        ProjectDataStore.save(project, layoutMaps, path);
     }
 
+    /**
+     * Load a project and its canvas layouts from the given file.
+     * Uses {@link ProjectDataStore} for the business model + raw
+     * layout maps, then adapts those maps into {@link CanvasModel}
+     * instances for the UI.
+     */
+    public LoadResult load(Path path) throws IOException {
+        Objects.requireNonNull(path, "path");
+
+        ProjectDataStore.LoadResult dataResult = ProjectDataStore.load(path);
+        ModelContracts.Project project = dataResult.project();
+
+        Map<String, CanvasModel> canvasLayouts = new LinkedHashMap<>();
+        Map<String, Map<String, Object>> layoutMaps = dataResult.layouts();
+        Map<String, Map<String, ModelContracts.ComponentId>> idMappings = dataResult.savedToRuntimeIds();
+
+        // For each circuit, adapt its layout map into a CanvasModel
+        for (ModelContracts.Circuit circuit : project.listCircuits()) {
+            String name = circuit.getName();
+            Map<String, Object> layoutMap = layoutMaps.get(name);
+            Map<String, ModelContracts.ComponentId> savedToRuntime =
+                    idMappings.getOrDefault(name, Map.of());
+
+            CanvasModel canvas = new CanvasModel();
+            applyLayout(layoutMap, circuit, savedToRuntime, canvas);
+            canvasLayouts.put(name, canvas);
+        }
+
+        return new LoadResult(project, canvasLayouts);
+    }
+
+    /**
+     * Convert a {@link CanvasModel} into a plain Map layout representation
+     * suitable for persistence. This keeps all UI-specific types out of
+     * the data layer.
+     */
     private Map<String, Object> serializeLayout(CanvasModel canvas) {
         Map<String, Object> layout = new LinkedHashMap<>();
         List<Map<String, Object>> comps = new ArrayList<>();
+
         if (canvas != null) {
             for (var fig : canvas.getFigures()) {
                 Map<String, Object> map = new LinkedHashMap<>();
@@ -81,10 +100,16 @@ public class ProjectPersistenceService {
             layout.put("inputOrder", inputOrder);
             layout.put("outputOrder", outputOrder);
         }
+
         layout.put("components", comps);
         return layout;
     }
 
+    /**
+     * Apply a persisted layout map to a {@link CanvasModel}, resolving saved
+     * component ids to runtime ids using the provided {@code savedToRuntime}
+     * mapping (produced during circuit reconstruction).
+     */
     private void applyLayout(Object layoutObj,
                              ModelContracts.Circuit circuit,
                              Map<String, ModelContracts.ComponentId> savedToRuntime,
@@ -93,8 +118,12 @@ public class ProjectPersistenceService {
             autoDistribute(circuit, canvas);
             return;
         }
+
         @SuppressWarnings("unchecked")
-        List<Map<String, Object>> comps = layoutMap.get("components") instanceof List ? (List<Map<String, Object>>) layoutMap.get("components") : List.of();
+        List<Map<String, Object>> comps = layoutMap.get("components") instanceof List
+                ? (List<Map<String, Object>>) layoutMap.get("components")
+                : List.of();
+
         int autoX = 30;
         int autoY = 40;
         for (Map<String, Object> comp : comps) {
@@ -102,20 +131,30 @@ public class ProjectPersistenceService {
             ModelContracts.ComponentId runtimeId = savedToRuntime.get(savedId);
             ModelContracts.Component component = runtimeId == null ? null : circuit.getComponent(runtimeId);
             if (component == null) continue;
+
             int x = parseInt(comp.get("x"), autoX);
             int y = parseInt(comp.get("y"), autoY);
             canvas.upsertComponent(component, new Point(x, y));
+
             Object label = comp.get("label");
             if (label != null) canvas.renameComponent(component.getId(), label.toString());
+
             autoX += 40;
             autoY += 20;
         }
+
         canvas.refreshPortOrdering(circuit.getInputComponentIds(), circuit.getOutputComponentIds());
+
         @SuppressWarnings("unchecked")
-        List<String> inputOrder = layoutMap.get("inputOrder") instanceof List ? (List<String>) layoutMap.get("inputOrder") : List.of();
+        List<String> inputOrder = layoutMap.get("inputOrder") instanceof List
+                ? (List<String>) layoutMap.get("inputOrder")
+                : List.of();
         canvas.setInputOrderDirect(resolveOrder(inputOrder, savedToRuntime));
+
         @SuppressWarnings("unchecked")
-        List<String> outputOrder = layoutMap.get("outputOrder") instanceof List ? (List<String>) layoutMap.get("outputOrder") : List.of();
+        List<String> outputOrder = layoutMap.get("outputOrder") instanceof List
+                ? (List<String>) layoutMap.get("outputOrder")
+                : List.of();
         canvas.setOutputOrderDirect(resolveOrder(outputOrder, savedToRuntime));
 
         // Ensure every component is present even if not saved previously
@@ -143,7 +182,8 @@ public class ProjectPersistenceService {
         }
     }
 
-    private List<ModelContracts.ComponentId> resolveOrder(List<String> savedOrder, Map<String, ModelContracts.ComponentId> savedToRuntime) {
+    private List<ModelContracts.ComponentId> resolveOrder(List<String> savedOrder,
+                                                          Map<String, ModelContracts.ComponentId> savedToRuntime) {
         List<ModelContracts.ComponentId> list = new ArrayList<>();
         for (String saved : savedOrder) {
             ModelContracts.ComponentId id = savedToRuntime.get(saved);
@@ -175,6 +215,10 @@ public class ProjectPersistenceService {
         }
     }
 
-    public record LoadResult(ModelContracts.Project project, Map<String, CanvasModel> layouts) { }
+    /**
+     * UI-layer load result bundling the business project with concrete
+     * {@link CanvasModel} layouts.
+     */
+    public record LoadResult(ModelContracts.Project project,
+                             Map<String, CanvasModel> layouts) { }
 }
-

@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "LogiSimApp",
+            "request": "launch",
+            "mainClass": "org.logisim.ui.LogiSimApp",
+            "projectName": "LogiSim-sim_787b6881"
+        },
+        {
+            "name": "Launch GateTests",
+            "type": "java",
+            "request": "launch",
+            "mainClass": "org.logisim.business.gates.GateTests",
+            "projectName": "LogiSim-sim",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "buildAll"
+        }
+    ]
+}

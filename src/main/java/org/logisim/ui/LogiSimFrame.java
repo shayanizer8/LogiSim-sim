@@ -16,6 +16,8 @@ import org.logisim.business.SimulationEngineImpl;
 import org.logisim.business.TruthTableGenerator;
 import org.logisim.ui.model.CanvasModel;
 import org.logisim.ui.persistence.ProjectPersistenceService;
+import org.logisim.data.CircuitRepository;
+import org.logisim.data.SimpleJson;
 import org.logisim.ui.view.BooleanExpressionDialog;
 import org.logisim.ui.view.CircuitCanvas;
 import org.logisim.ui.view.CircuitCanvas.PortRef;
@@ -55,6 +57,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -75,6 +78,7 @@ public class LogiSimFrame extends JFrame implements
     private final ProjectImpl project;
     private final SimulationEngineImpl engine;
     private final ProjectPersistenceService persistenceService = new ProjectPersistenceService();
+    private final CircuitRepository circuitRepo = new CircuitRepository();
 
     private final DefaultListModel<String> circuitListModel = new DefaultListModel<>();
     private final JList<String> circuitList = new JList<>(circuitListModel);
@@ -90,6 +94,363 @@ public class LogiSimFrame extends JFrame implements
     private Supplier<ModelContracts.Component> pendingPlacementFactory;
     private boolean wireMode;
     private String wireColor = "black";
+    
+    // Track what has been generated for saving to database
+    private Map<ComponentId, Map<Integer, Signal>> lastSimulatedOutputs = null;
+    private List<TruthTableGenerator.TruthRow> lastGeneratedTruthTable = null;
+    private Map<ComponentId, String> lastGeneratedExpressions = null;
+
+    /**
+     * Manual save to database - saves circuit, simulation results, truth table, and boolean expressions.
+     * Only saves what exists/is available and shows detailed messages.
+     */
+    private void saveToDatabase() {
+        if (activeCircuit == null) {
+            JOptionPane.showMessageDialog(this, "No active circuit to save.", "Save to Database", 
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        List<String> saved = new ArrayList<>();
+        List<String> notSaved = new ArrayList<>();
+
+        try {
+            // Serialize layout data (component positions)
+            String layoutDataJson = null;
+            if (activeCanvas != null) {
+                Map<String, Object> layoutMap = serializeLayout(activeCanvas);
+                layoutDataJson = SimpleJson.stringify(layoutMap);
+            }
+            
+            // Save the circuit with layout data (always)
+            circuitRepo.saveCircuit(activeCircuit, project.getName(), layoutDataJson);
+            saved.add("Circuit");
+            
+            // Only save simulation results if simulation was run (from Outputs panel)
+            if (lastSimulatedOutputs != null && !lastSimulatedOutputs.isEmpty()) {
+                try {
+                    // Filter to only output components (OutputPin/LED) - what's shown in Outputs panel
+                    Map<ComponentId, Map<Integer, Signal>> outputOnlyResults = new LinkedHashMap<>();
+                    Set<ComponentId> outputComponentIds = activeCircuit.getOutputComponentIds();
+                    
+                    // First, check what's in lastSimulatedOutputs (includes OutputPin values we added)
+                    for (var entry : lastSimulatedOutputs.entrySet()) {
+                        ComponentId componentId = entry.getKey();
+                        // Only save if this is an output component (like OutputPin which has type "OUTPUT")
+                        if (outputComponentIds.contains(componentId)) {
+                            var comp = activeCircuit.getComponent(componentId);
+                            // Double check it's actually an OutputPin/LED (has no outputs, only inputs)
+                            if (comp != null && comp.getOutputs().isEmpty() && !comp.getInputs().isEmpty()) {
+                                // Only save if there are defined (non-UNDEFINED) values
+                                Map<Integer, Signal> portValues = entry.getValue();
+                                Map<Integer, Signal> definedValues = new LinkedHashMap<>();
+                                for (var portEntry : portValues.entrySet()) {
+                                    if (portEntry.getValue() != Signal.UNDEFINED) {
+                                        definedValues.put(portEntry.getKey(), portEntry.getValue());
+                                    }
+                                }
+                                if (!definedValues.isEmpty()) {
+                                    outputOnlyResults.put(componentId, definedValues);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Also check OutputPin components directly in case they weren't in lastSimulatedOutputs
+                    for (ComponentId outputId : outputComponentIds) {
+                        if (!outputOnlyResults.containsKey(outputId)) {
+                            var comp = activeCircuit.getComponent(outputId);
+                            if (comp instanceof OutputPin op) {
+                                Signal observedValue = op.getObservedValue();
+                                if (observedValue != Signal.UNDEFINED) {
+                                    outputOnlyResults.put(outputId, Map.of(0, observedValue));
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (!outputOnlyResults.isEmpty()) {
+                        circuitRepo.saveSimulationResults(activeCircuit.getName(), outputOnlyResults);
+                        saved.add("Simulation Results");
+                    } else {
+                        notSaved.add("Simulation Results (no output components with defined values)");
+                    }
+                } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING, "Could not save simulation results", ex);
+                    notSaved.add("Simulation Results (error: " + ex.getMessage() + ")");
+                }
+            } else {
+                notSaved.add("Simulation Results (simulation not run - click 'Run Simulation' first)");
+            }
+            
+            // Only save truth table if it was explicitly generated
+            if (lastGeneratedTruthTable != null && !lastGeneratedTruthTable.isEmpty()) {
+                try {
+                    circuitRepo.saveTruthTable(activeCircuit.getName(), lastGeneratedTruthTable);
+                    saved.add("Truth Table");
+                } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING, "Could not save truth table", ex);
+                    notSaved.add("Truth Table (error: " + ex.getMessage() + ")");
+                }
+            } else {
+                notSaved.add("Truth Table (not generated - click 'Generate Truth Table' first)");
+            }
+            
+            // Only save boolean expressions if they were explicitly generated
+            if (lastGeneratedExpressions != null && !lastGeneratedExpressions.isEmpty()) {
+                try {
+                    circuitRepo.saveBooleanExpressions(activeCircuit.getName(), lastGeneratedExpressions);
+                    saved.add("Boolean Expressions");
+                } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING, "Could not save boolean expressions", ex);
+                    notSaved.add("Boolean Expressions (error: " + ex.getMessage() + ")");
+                }
+            } else {
+                notSaved.add("Boolean Expressions (not generated - click 'Generate Boolean Expression' first)");
+            }
+            
+            // Build message
+            StringBuilder message = new StringBuilder();
+            message.append("Save to Database Results:\n\n");
+            
+            if (!saved.isEmpty()) {
+                message.append("✓ Saved:\n");
+                for (String item : saved) {
+                    message.append("  • ").append(item).append("\n");
+                }
+                message.append("\n");
+            }
+            
+            if (!notSaved.isEmpty()) {
+                message.append("✗ Not Saved:\n");
+                for (String item : notSaved) {
+                    message.append("  • ").append(item).append("\n");
+                }
+            }
+            
+            statusBar.setText("Save to database completed for '" + activeCircuit.getName() + "'");
+            
+            int messageType = notSaved.isEmpty() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
+            JOptionPane.showMessageDialog(this, message.toString(), "Save to Database", messageType);
+            
+        } catch (Exception ex) {
+            LOGGER.log(Level.SEVERE, "Failed to save to database", ex);
+            JOptionPane.showMessageDialog(this, 
+                    "Failed to save to database: " + ex.getMessage(), 
+                    "Save to Database", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    /**
+     * Load a circuit from the database.
+     * Shows a dialog to select a circuit, then loads it with all associated data.
+     */
+    private void loadFromDatabase() {
+        try {
+            // Get list of circuits from database
+            List<String> circuitNames = circuitRepo.listCircuits();
+            
+            if (circuitNames.isEmpty()) {
+                JOptionPane.showMessageDialog(this, 
+                        "No circuits found in database.", 
+                        "Load from Database", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            
+            // Show selection dialog
+            String selectedName = (String) JOptionPane.showInputDialog(
+                    this,
+                    "Select a circuit to load:",
+                    "Load from Database",
+                    JOptionPane.PLAIN_MESSAGE,
+                    null,
+                    circuitNames.toArray(),
+                    circuitNames.get(0));
+            
+            if (selectedName == null || selectedName.isBlank()) {
+                return; // User cancelled
+            }
+            
+            // Check if circuit already exists in project
+            if (project.getCircuit(selectedName) != null) {
+                int result = JOptionPane.showConfirmDialog(this,
+                        "Circuit '" + selectedName + "' already exists in project.\n" +
+                        "Do you want to replace it?",
+                        "Load from Database",
+                        JOptionPane.YES_NO_OPTION,
+                        JOptionPane.QUESTION_MESSAGE);
+                
+                if (result != JOptionPane.YES_OPTION) {
+                    return;
+                }
+                
+                // Remove existing circuit
+                ModelContracts.Circuit existing = project.getCircuit(selectedName);
+                if (existing != null) {
+                    existing.removeModelChangeListener(this);
+                    project.removeCircuit(selectedName);
+                    circuitListModel.removeElement(selectedName);
+                    canvasesByCircuit.remove(selectedName);
+                }
+            }
+            
+            // Check what exists in database
+            boolean circuitExists = circuitRepo.loadCircuit(selectedName) != null;
+            boolean hasSimResults = circuitRepo.hasSimulationResults(selectedName);
+            boolean hasTruthTable = circuitRepo.hasTruthTable(selectedName);
+            boolean hasExpressions = circuitRepo.hasBooleanExpressions(selectedName);
+            
+            if (!circuitExists) {
+                JOptionPane.showMessageDialog(this,
+                        "Circuit '" + selectedName + "' not found in database.",
+                        "Load from Database",
+                        JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            
+            List<String> loaded = new ArrayList<>();
+            List<String> notLoaded = new ArrayList<>();
+            
+            // Load circuit with ID mapping (always if it exists)
+            CircuitRepository.CircuitLoadResult loadResult = circuitRepo.loadCircuitWithMapping(selectedName);
+            if (loadResult != null && loadResult.circuit() != null) {
+                ModelContracts.Circuit loadedCircuit = loadResult.circuit();
+                Map<String, ModelContracts.ComponentId> savedToRuntimeIds = loadResult.savedToRuntimeIds();
+                
+                // Add circuit to project
+                loadedCircuit.addModelChangeListener(this);
+                project.addCircuit(loadedCircuit);
+                
+                // Add to UI
+                if (!circuitListModel.contains(selectedName)) {
+                    circuitListModel.addElement(selectedName);
+                }
+                
+                // Create canvas and restore layout from saved data
+                CanvasModel canvas = new CanvasModel();
+                String layoutDataJson = loadResult.layoutData();
+                if (layoutDataJson != null && !layoutDataJson.isBlank()) {
+                    // Restore saved layout (component positions)
+                    restoreLayout(layoutDataJson, loadedCircuit, savedToRuntimeIds, canvas);
+                } else {
+                    // Fallback to auto-distribute if no layout data
+                    autoDistributeComponents(loadedCircuit, canvas);
+                }
+                canvasesByCircuit.put(selectedName, canvas);
+                
+                // Switch to loaded circuit
+                circuitList.setSelectedValue(selectedName, true);
+                setActiveCircuit(loadedCircuit);
+                
+                loaded.add("Circuit");
+                
+                // Load simulation results only if they exist
+                if (hasSimResults) {
+                    try {
+                        Map<ComponentId, Map<Integer, Signal>> simResults = circuitRepo.loadSimulationResults(selectedName);
+                        // Map saved component IDs to runtime IDs
+                        Map<ComponentId, Map<Integer, Signal>> mappedResults = new LinkedHashMap<>();
+                        for (var entry : simResults.entrySet()) {
+                            // Find matching runtime ID
+                            ComponentId savedId = entry.getKey();
+                            ComponentId runtimeId = savedToRuntimeIds.get(savedId.id());
+                            if (runtimeId != null) {
+                                mappedResults.put(runtimeId, entry.getValue());
+                            }
+                        }
+                        if (!mappedResults.isEmpty()) {
+                            // Display loaded simulation results in the simulation panel
+                            simulationPanel.showOutputs(collapseOutputs(mappedResults), this::componentLabel);
+                            loaded.add("Simulation Results");
+                        } else {
+                            notLoaded.add("Simulation Results (empty or invalid)");
+                        }
+                    } catch (Exception ex) {
+                        LOGGER.log(Level.WARNING, "Could not load simulation results", ex);
+                        notLoaded.add("Simulation Results (error: " + ex.getMessage() + ")");
+                    }
+                } else {
+                    notLoaded.add("Simulation Results (not saved in database)");
+                }
+                
+                // Load truth table only if it exists (using correct ID mapping)
+                if (hasTruthTable) {
+                    try {
+                        List<TruthTableGenerator.TruthRow> truthTable = circuitRepo.loadTruthTable(selectedName, savedToRuntimeIds);
+                        if (!truthTable.isEmpty()) {
+                            // Store loaded truth table for viewing - this is the exact saved truth table
+                            lastGeneratedTruthTable = truthTable;
+                            // Also restore input/output order for proper display
+                            if (canvas != null) {
+                                // Input/output order should already be restored from layout, but ensure it's set
+                                canvas.refreshPortOrdering(loadedCircuit.getInputComponentIds(), loadedCircuit.getOutputComponentIds());
+                            }
+                            loaded.add("Truth Table");
+                        } else {
+                            notLoaded.add("Truth Table (empty or invalid)");
+                        }
+                    } catch (Exception ex) {
+                        LOGGER.log(Level.WARNING, "Could not load truth table", ex);
+                        notLoaded.add("Truth Table (error: " + ex.getMessage() + ")");
+                    }
+                } else {
+                    notLoaded.add("Truth Table (not saved in database)");
+                }
+                
+                // Load boolean expressions only if they exist (using correct ID mapping)
+                if (hasExpressions) {
+                    try {
+                        Map<ComponentId, String> expressions = circuitRepo.loadBooleanExpressions(selectedName, savedToRuntimeIds);
+                        if (!expressions.isEmpty()) {
+                            // Store loaded expressions for viewing
+                            lastGeneratedExpressions = expressions;
+                            loaded.add("Boolean Expressions");
+                        } else {
+                            notLoaded.add("Boolean Expressions (empty or invalid)");
+                        }
+                    } catch (Exception ex) {
+                        LOGGER.log(Level.WARNING, "Could not load boolean expressions", ex);
+                        notLoaded.add("Boolean Expressions (error: " + ex.getMessage() + ")");
+                    }
+                } else {
+                    notLoaded.add("Boolean Expressions (not saved in database)");
+                }
+            } else {
+                notLoaded.add("Circuit (failed to load)");
+            }
+            
+            // Build message
+            StringBuilder message = new StringBuilder();
+            message.append("Load from Database Results:\n\n");
+            
+            if (!loaded.isEmpty()) {
+                message.append("✓ Loaded:\n");
+                for (String item : loaded) {
+                    message.append("  • ").append(item).append("\n");
+                }
+                message.append("\n");
+            }
+            
+            if (!notLoaded.isEmpty()) {
+                message.append("✗ Not Loaded:\n");
+                for (String item : notLoaded) {
+                    message.append("  • ").append(item).append("\n");
+                }
+            }
+            
+            statusBar.setText("Loaded '" + selectedName + "' from database");
+            
+            int messageType = notLoaded.isEmpty() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
+            JOptionPane.showMessageDialog(this, message.toString(), "Load from Database", messageType);
+                    
+        } catch (Exception ex) {
+            LOGGER.log(Level.SEVERE, "Failed to load from database", ex);
+            JOptionPane.showMessageDialog(this,
+                    "Failed to load from database: " + ex.getMessage(),
+                    "Load from Database",
+                    JOptionPane.ERROR_MESSAGE);
+        }
+    }
 
     private Map<ComponentId, Signal> collapseOutputs(Map<ComponentId, Map<Integer, Signal>> outputs) {
         Map<ComponentId, Signal> collapsed = new LinkedHashMap<>();
@@ -145,9 +506,16 @@ public class LogiSimFrame extends JFrame implements
             if (!e.getValueIsAdjusting()) switchCircuit(circuitList.getSelectedValue());
         });
         projectPanel.add(new JScrollPane(circuitList), BorderLayout.CENTER);
+        JPanel circuitButtons = new JPanel();
+        circuitButtons.setLayout(new BoxLayout(circuitButtons, BoxLayout.Y_AXIS));
         JButton addCircuitBtn = new JButton("New Circuit");
         addCircuitBtn.addActionListener(e -> promptNewCircuit());
-        projectPanel.add(addCircuitBtn, BorderLayout.SOUTH);
+        JButton deleteCircuitBtn = new JButton("Delete from Panel");
+        deleteCircuitBtn.addActionListener(e -> deleteCircuitFromPanel());
+        circuitButtons.add(addCircuitBtn);
+        circuitButtons.add(Box.createVerticalStrut(4));
+        circuitButtons.add(deleteCircuitBtn);
+        projectPanel.add(circuitButtons, BorderLayout.SOUTH);
         leftPanel.add(projectPanel, BorderLayout.CENTER);
 
         JPanel rightPanel = new JPanel();
@@ -192,6 +560,10 @@ public class LogiSimFrame extends JFrame implements
         panel.add(actionButton("Save Project", e -> saveProject()));
         panel.add(Box.createVerticalStrut(6));
         panel.add(actionButton("Load Project", e -> loadProject()));
+        panel.add(Box.createVerticalStrut(6));
+        panel.add(actionButton("Save to Database", e -> saveToDatabase()));
+        panel.add(Box.createVerticalStrut(6));
+        panel.add(actionButton("Load from Database", e -> loadFromDatabase()));
 
         return panel;
     }
@@ -212,6 +584,10 @@ public class LogiSimFrame extends JFrame implements
         if (canvas != null) {
             canvas.setModel(activeCanvas);
         }
+        // Reset generated data when switching circuits
+        lastSimulatedOutputs = null;
+        lastGeneratedTruthTable = null;
+        lastGeneratedExpressions = null;
     }
 
     private void switchCircuit(String name) {
@@ -235,6 +611,219 @@ public class LogiSimFrame extends JFrame implements
         circuitListModel.addElement(name);
         canvasesByCircuit.put(name, new CanvasModel());
         circuitList.setSelectedValue(name, true);
+    }
+    
+    /**
+     * Delete circuit from panel only (not from database).
+     * This removes it from the UI but keeps it in the database.
+     */
+    private void deleteCircuitFromPanel() {
+        String selectedName = circuitList.getSelectedValue();
+        if (selectedName == null) {
+            JOptionPane.showMessageDialog(this, "Select a circuit to delete from panel.", 
+                    "Delete from Panel", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        
+        int result = JOptionPane.showConfirmDialog(this,
+                "Remove circuit '" + selectedName + "' from panel?\n" +
+                "(Circuit will remain in database)",
+                "Delete from Panel",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.QUESTION_MESSAGE);
+        
+        if (result != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        // Remove from project and UI
+        ModelContracts.Circuit circuit = project.getCircuit(selectedName);
+        if (circuit != null) {
+            circuit.removeModelChangeListener(this);
+            project.removeCircuit(selectedName);
+        }
+        circuitListModel.removeElement(selectedName);
+        canvasesByCircuit.remove(selectedName);
+        
+        // Switch to another circuit if available
+        if (circuitListModel.getSize() > 0) {
+            circuitList.setSelectedIndex(0);
+            switchCircuit(circuitListModel.getElementAt(0));
+        } else {
+            // Create a default circuit if none remain
+            ModelContracts.Circuit defaultCircuit = new InMemoryCircuit("Main");
+            defaultCircuit.addModelChangeListener(this);
+            project.addCircuit(defaultCircuit);
+            circuitListModel.addElement(defaultCircuit.getName());
+            canvasesByCircuit.put(defaultCircuit.getName(), new CanvasModel());
+            setActiveCircuit(defaultCircuit);
+        }
+        
+        statusBar.setText("Removed '" + selectedName + "' from panel");
+    }
+    
+    /**
+     * Serialize layout (component positions) to a map structure.
+     */
+    private Map<String, Object> serializeLayout(CanvasModel canvas) {
+        Map<String, Object> layout = new LinkedHashMap<>();
+        List<Map<String, Object>> comps = new ArrayList<>();
+
+        if (canvas != null) {
+            for (var fig : canvas.getFigures()) {
+                Map<String, Object> map = new LinkedHashMap<>();
+                map.put("id", fig.component().getId().id());
+                map.put("x", fig.bounds().x);
+                map.put("y", fig.bounds().y);
+                map.put("label", fig.label());
+                comps.add(map);
+            }
+            List<String> inputOrder = canvas.getInputOrder().stream().map(id -> id.id()).toList();
+            List<String> outputOrder = canvas.getOutputOrder().stream().map(id -> id.id()).toList();
+            layout.put("inputOrder", inputOrder);
+            layout.put("outputOrder", outputOrder);
+        }
+
+        layout.put("components", comps);
+        return layout;
+    }
+    
+    /**
+     * Restore layout from saved JSON data.
+     */
+    private void restoreLayout(String layoutDataJson,
+                               ModelContracts.Circuit circuit,
+                               Map<String, ModelContracts.ComponentId> savedToRuntimeIds,
+                               CanvasModel canvas) {
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> layoutMap = (Map<String, Object>) SimpleJson.parseFromString(layoutDataJson);
+            
+            if (layoutMap == null) {
+                autoDistributeComponents(circuit, canvas);
+                return;
+            }
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> comps = layoutMap.get("components") instanceof List
+                    ? (List<Map<String, Object>>) layoutMap.get("components")
+                    : List.of();
+
+            int autoX = 30;
+            int autoY = 40;
+            for (Map<String, Object> comp : comps) {
+                String savedId = comp.get("id") == null ? null : comp.get("id").toString();
+                ModelContracts.ComponentId runtimeId = savedToRuntimeIds.get(savedId);
+                ModelContracts.Component component = runtimeId == null ? null : circuit.getComponent(runtimeId);
+                if (component == null) continue;
+
+                int x = parseInt(comp.get("x"), autoX);
+                int y = parseInt(comp.get("y"), autoY);
+                canvas.upsertComponent(component, new Point(x, y));
+
+                Object label = comp.get("label");
+                if (label != null) canvas.renameComponent(component.getId(), label.toString());
+
+                autoX += 40;
+                autoY += 20;
+            }
+
+            canvas.refreshPortOrdering(circuit.getInputComponentIds(), circuit.getOutputComponentIds());
+
+            @SuppressWarnings("unchecked")
+            List<String> inputOrder = layoutMap.get("inputOrder") instanceof List
+                    ? (List<String>) layoutMap.get("inputOrder")
+                    : List.of();
+            List<ComponentId> resolvedInputOrder = new ArrayList<>();
+            for (String saved : inputOrder) {
+                ComponentId id = savedToRuntimeIds.get(saved);
+                if (id != null) resolvedInputOrder.add(id);
+            }
+            canvas.setInputOrderDirect(resolvedInputOrder);
+
+            @SuppressWarnings("unchecked")
+            List<String> outputOrder = layoutMap.get("outputOrder") instanceof List
+                    ? (List<String>) layoutMap.get("outputOrder")
+                    : List.of();
+            List<ComponentId> resolvedOutputOrder = new ArrayList<>();
+            for (String saved : outputOrder) {
+                ComponentId id = savedToRuntimeIds.get(saved);
+                if (id != null) resolvedOutputOrder.add(id);
+            }
+            canvas.setOutputOrderDirect(resolvedOutputOrder);
+
+            // Ensure every component is present even if not saved previously
+            for (var comp : circuit.getComponents()) {
+                if (canvas.getFigure(comp.getId()) == null) {
+                    canvas.upsertComponent(comp, new Point(autoX, autoY));
+                    autoX += 60;
+                }
+            }
+
+            // Populate connector figures so wires show immediately after loading
+            for (var connector : circuit.getConnectors()) {
+                canvas.setConnector(connector);
+                canvas.clearInputState(connector.getSinkComponentId(), connector.getSinkPortIndex());
+            }
+
+            // Initialize output visuals (e.g., input switches showing red/green state)
+            for (var component : circuit.getComponents()) {
+                if (component.getOutputs().isEmpty()) continue;
+                Map<Integer, ModelContracts.Signal> outputState = new LinkedHashMap<>();
+                for (var port : component.getOutputs()) {
+                    outputState.put(port.index(), component.getOutputValue(port.index()));
+                }
+                canvas.updateOutputs(component, outputState);
+            }
+        } catch (Exception ex) {
+            LOGGER.log(Level.WARNING, "Failed to restore layout, using auto-distribute", ex);
+            autoDistributeComponents(circuit, canvas);
+        }
+    }
+    
+    private int parseInt(Object obj, int defaultValue) {
+        if (obj instanceof Number) return ((Number) obj).intValue();
+        if (obj instanceof String) {
+            try {
+                return Integer.parseInt((String) obj);
+            } catch (NumberFormatException e) {
+                return defaultValue;
+            }
+        }
+        return defaultValue;
+    }
+    
+    /**
+     * Auto-distribute components on canvas so they're visible.
+     */
+    private void autoDistributeComponents(ModelContracts.Circuit circuit, CanvasModel canvas) {
+        int x = 40;
+        int y = 40;
+        for (var comp : circuit.getComponents()) {
+            canvas.upsertComponent(comp, new Point(x, y));
+            x += 120;
+            if (x > 600) {
+                x = 40;
+                y += 100;
+            }
+        }
+        canvas.refreshPortOrdering(circuit.getInputComponentIds(), circuit.getOutputComponentIds());
+        
+        // Add connectors to canvas so wires are visible
+        for (var connector : circuit.getConnectors()) {
+            canvas.setConnector(connector);
+            canvas.clearInputState(connector.getSinkComponentId(), connector.getSinkPortIndex());
+        }
+        
+        // Initialize output visuals (e.g., input switches showing red/green state)
+        for (var component : circuit.getComponents()) {
+            if (component.getOutputs().isEmpty()) continue;
+            Map<Integer, ModelContracts.Signal> outputState = new LinkedHashMap<>();
+            for (var port : component.getOutputs()) {
+                outputState.put(port.index(), component.getOutputValue(port.index()));
+            }
+            canvas.updateOutputs(component, outputState);
+        }
     }
 
     private String componentLabel(ComponentId id) {
@@ -407,10 +996,29 @@ public class LogiSimFrame extends JFrame implements
         protected void done() {
             try {
                 Map<ComponentId, Map<Integer, Signal>> outputs = get();
-                simulationPanel.showOutputs(collapseOutputs(outputs), LogiSimFrame.this::componentLabel);
+                
+                // Collect outputs from OutputPin components (which use getObservedValue, not standard outputs)
+                Map<ComponentId, Map<Integer, Signal>> allOutputs = new LinkedHashMap<>(outputs);
+                Set<ComponentId> outputComponentIds = activeCircuit.getOutputComponentIds();
+                
+                for (ComponentId outputId : outputComponentIds) {
+                    var comp = activeCircuit.getComponent(outputId);
+                    if (comp instanceof OutputPin op) {
+                        // OutputPin stores its value in observed, not in standard outputValues
+                        Signal observedValue = op.getObservedValue();
+                        if (observedValue != Signal.UNDEFINED) {
+                            allOutputs.put(outputId, Map.of(0, observedValue));
+                        }
+                    }
+                }
+                
+                // Store the simulation outputs for saving to database (includes OutputPin values)
+                lastSimulatedOutputs = allOutputs;
+                simulationPanel.showOutputs(collapseOutputs(allOutputs), LogiSimFrame.this::componentLabel);
                 statusBar.setText("Simulation complete");
             } catch (Exception ex) {
                 LOGGER.log(Level.SEVERE, "Simulation failed", ex);
+                lastSimulatedOutputs = null; // Clear on error
                 JOptionPane.showMessageDialog(LogiSimFrame.this, "Simulation error: " + ex.getMessage(),
                         "Simulation", JOptionPane.ERROR_MESSAGE);
             }
@@ -419,6 +1027,16 @@ public class LogiSimFrame extends JFrame implements
 
     private void showTruthTable() {
         if (activeCircuit == null) return;
+        
+        // If we have a loaded truth table, use it instead of regenerating
+        if (lastGeneratedTruthTable != null && !lastGeneratedTruthTable.isEmpty()) {
+            TruthTableDialog dialog = new TruthTableDialog(this, lastGeneratedTruthTable, 
+                    activeCanvas.getInputOrder(), activeCanvas.getOutputOrder(), this::componentLabel);
+            dialog.setVisible(true);
+            return;
+        }
+        
+        // Otherwise, generate a new one
         if (!hasDeclaredInputs()) {
             JOptionPane.showMessageDialog(this,
                     "Truth tables require Input Switch components representing each external input.\n" +
@@ -438,6 +1056,8 @@ public class LogiSimFrame extends JFrame implements
             restoreInputPins(snapshot);
             recomputeOutputsSilently();
         }
+        // Store the generated truth table for saving to database
+        lastGeneratedTruthTable = rows;
         TruthTableDialog dialog = new TruthTableDialog(this, rows, activeCanvas.getInputOrder(),
                 activeCanvas.getOutputOrder(), this::componentLabel);
         dialog.setVisible(true);
@@ -459,8 +1079,11 @@ public class LogiSimFrame extends JFrame implements
             restoreInputPins(snapshot);
             recomputeOutputsSilently();
         }
+        // Store the generated expressions for saving to database
+        lastGeneratedExpressions = expressions;
         BooleanExpressionDialog dialog = new BooleanExpressionDialog(this, expressions, this::componentLabel);
         dialog.setVisible(true);
+        lastGeneratedExpressions = expressions;
     }
 
     private boolean hasDeclaredInputs() {

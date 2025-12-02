@@ -1,4 +1,4 @@
-package org.logisim.ui.persistence;
+package org.logisim.data;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -37,6 +37,33 @@ public final class SimpleJson {
         @SuppressWarnings("unchecked")
         Map<String, Object> map = (Map<String, Object>) value;
         return map;
+    }
+
+    /**
+     * Parse a JSON string into a Map. Useful for parsing JSON stored in database.
+     */
+    public static Map<String, Object> readObjectFromString(String json) {
+        if (json == null || json.trim().isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+        Object value = new Parser(json).parseValue();
+        if (!(value instanceof Map)) {
+            throw new IllegalArgumentException("JSON string must represent an object");
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> map = (Map<String, Object>) value;
+        return map;
+    }
+
+    /**
+     * Parse a JSON string into an Object (can be Map, List, String, Number, Boolean, null).
+     * Useful for parsing JSON stored in database.
+     */
+    public static Object parseFromString(String json) {
+        if (json == null || json.trim().isEmpty()) {
+            return null;
+        }
+        return new Parser(json).parseValue();
     }
 
     public static String stringify(Object value) {
@@ -230,4 +257,3 @@ public final class SimpleJson {
         }
     }
 }
-
