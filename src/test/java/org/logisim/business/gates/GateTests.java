@@ -6,10 +6,19 @@ import org.logisim.business.ModelContracts.Signal;
  * Lightweight unit tests for basic gates.
  *
  * This avoids any external test framework so there are no extra
- * dependencies. Run via:
+ * dependencies. Compile and run via (from project root):
  *
- *   javac -cp src;bin -d bin src/test/java/org/logisim/business/gates/GateTests.java
+ *   javac -cp "src/main/java;bin" -d bin src/test/java/org/logisim/business/gates/GateTests.java
  *   java  -cp bin org.logisim.business.gates.GateTests
+ *
+ * You can also run only one group of gate tests:
+ *
+ *   java -cp bin org.logisim.business.gates.GateTests AND
+ *   java -cp bin org.logisim.business.gates.GateTests OR
+ *   java -cp bin org.logisim.business.gates.GateTests NOT
+ *   java -cp bin org.logisim.business.gates.GateTests NAND
+ *   java -cp bin org.logisim.business.gates.GateTests NOR
+ *   java -cp bin org.logisim.business.gates.GateTests XOR
  *
  * (On Linux/macOS, replace ';' with ':'.)
  */
@@ -21,12 +30,20 @@ public class GateTests {
     public static void main(String[] args) {
         System.out.println("Running gate tests...");
 
-        testAndGateTruthTable();
-        testOrGateTruthTable();
-        testNotGateTruthTable();
-        testNandGateTruthTable();
-        testNorGateTruthTable();
-        testXorGateTruthTable();
+        boolean runAll = (args == null || args.length == 0);
+        boolean runAND  = runAll || contains(args, "AND");
+        boolean runOR   = runAll || contains(args, "OR");
+        boolean runNOT  = runAll || contains(args, "NOT");
+        boolean runNAND = runAll || contains(args, "NAND");
+        boolean runNOR  = runAll || contains(args, "NOR");
+        boolean runXOR  = runAll || contains(args, "XOR");
+
+        if (runAND)  testAndGateTruthTable();
+        if (runOR)   testOrGateTruthTable();
+        if (runNOT)  testNotGateTruthTable();
+        if (runNAND) testNandGateTruthTable();
+        if (runNOR)  testNorGateTruthTable();
+        if (runXOR)  testXorGateTruthTable();
 
         System.out.println();
         System.out.println("Total assertions: " + total);
@@ -39,6 +56,13 @@ public class GateTests {
         }
 
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    private static boolean contains(String[] args, String name) {
+        for (String a : args) {
+            if (a != null && a.equalsIgnoreCase(name)) return true;
+        }
+        return false;
     }
 
     private static void assertEquals(String testName, Signal expected, Signal actual) {
